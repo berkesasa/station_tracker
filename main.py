@@ -81,40 +81,33 @@ class IETTBot:
         try:
             logger.info(f"🔍 Durak {station_code} için bilgi alınıyor...")
             
-            # Önce web scraping ile dene (daha güvenilir)
-            result = self.scrape_station_info(station_code)
-            if result and result.get("buses"):
-                # Fallback veri kontrolü - gerçek veri mi?
-                real_buses = [bus for bus in result["buses"] if bus.get("line") != "Veri Yok"]
-                if real_buses:
-                    logger.info(f"✅ Web scraping başarılı: {len(real_buses)} gerçek otobüs bulundu")
-                    for bus in real_buses[:3]:
-                        logger.info(f"   📍 {bus.get('line')} - {bus.get('estimated_minutes')} dk - {bus.get('direction', '')[:40]}")
-                    result["buses"] = real_buses
-                    return result
-                else:
-                    logger.warning(f"⚠️ Web scraping'den sadece fallback veri geldi")
-            
-            # İETT'nin alternatif API endpoint'lerini dene
-            api_endpoints = [
-                f"https://api.iett.istanbul/api/v1/stations/{station_code}/arrivals",
-                f"https://mobil.iett.gov.tr/api/durak/{station_code}",
-                f"https://iett.istanbul/api/arrivals/{station_code}"
+            # Çoklu strateji ile veri toplama
+            strategies = [
+                ("Web Scraping", self.scrape_station_info),
+                ("Advanced Scraping", self.advanced_scrape_station),
+                ("Mobile API", self.try_mobile_apis),
+                ("Alternative Sources", self.try_alternative_sources)
             ]
             
-            for api_url in api_endpoints:
+            for strategy_name, strategy_func in strategies:
                 try:
-                    logger.info(f"API deneniyor: {api_url}")
-                    response = self.session.get(api_url, timeout=8)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data and isinstance(data, dict):
-                            logger.info(f"API başarılı: {api_url}")
-                            api_result = self.process_api_response(data, station_code)
-                            if api_result and api_result.get("buses"):
-                                return api_result
+                    logger.info(f"🔄 {strategy_name} deneniyor...")
+                    result = strategy_func(station_code)
+                    
+                    if result and result.get("buses"):
+                        # Gerçek veri kontrolü
+                        real_buses = [bus for bus in result["buses"] if bus.get("line") != "Veri Yok"]
+                        if real_buses:
+                            logger.info(f"✅ {strategy_name} başarılı: {len(real_buses)} otobüs bulundu")
+                            for bus in real_buses[:3]:
+                                logger.info(f"   📍 {bus.get('line')} - {bus.get('estimated_minutes')} dk")
+                            result["buses"] = real_buses
+                            return result
+                        else:
+                            logger.warning(f"⚠️ {strategy_name}'den sadece fallback veri geldi")
+                
                 except Exception as e:
-                    logger.debug(f"API hatası {api_url}: {e}")
+                    logger.debug(f"{strategy_name} hatası: {e}")
                     continue
             
             # Son çare olarak fallback veri dön
@@ -238,9 +231,15 @@ class IETTBot:
         return None
     
     def get_ajax_station_data(self, station_code):
-        """İETT'nin AJAX endpoint'inden veri çeker"""
+        """İBB resmi API'lerinden veri çeker"""
         try:
-            # Bilinen AJAX endpoint'leri
+            # Önce İBB resmi API'lerini dene
+            ibb_result = self.get_ibb_api_data(station_code)
+            if ibb_result:
+                logger.info(f"İBB API'den başarılı veri alındı: {len(ibb_result)} otobüs")
+                return ibb_result
+            
+            # Fallback: Eski AJAX endpoint'leri
             ajax_urls = [
                 f"https://iett.istanbul/api/stations/{station_code}/arrivals",
                 f"https://iett.istanbul/StationDetail/GetStationArrivals?stationId={station_code}",
@@ -315,6 +314,667 @@ class IETTBot:
         except Exception as e:
             logger.error(f"AJAX veri çekme hatası: {e}")
             return None
+    
+    def get_ibb_api_data(self, station_code):
+        """İBB resmi API'lerinden durak bilgilerini çeker"""
+        try:
+            # Farklı İBB API methodlarını dene
+            api_methods = [
+                self.call_durak_detay_gyy,
+                self.call_get_stop_lines,
+                self.call_durak_cekmekoy,
+                self.call_filo_durum
+            ]
+            
+            for method in api_methods:
+                try:
+                    result = method(station_code)
+                    if result and result.get("buses"):
+                        logger.info(f"İBB API başarılı: {method.__name__}")
+                        return result
+                except Exception as e:
+                    logger.debug(f"İBB API method hatası {method.__name__}: {e}")
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"İBB API genel hatası: {e}")
+            return None
+    
+    def call_durak_detay_gyy(self, station_code):
+        """DurakDetay_GYY methodunu çağırır"""
+        try:
+            url = "https://api.ibb.gov.tr/iett/ibb/ibb.asmx"
+            
+            # SOAP XML body oluştur
+            soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <DurakDetay_GYY xmlns="http://tempuri.org/">
+      <DurakKodu>{station_code}</DurakKodu>
+    </DurakDetay_GYY>
+  </soap:Body>
+</soap:Envelope>"""
+            
+            headers = {
+                'Content-Type': 'text/xml; charset=utf-8',
+                'SOAPAction': '"http://tempuri.org/DurakDetay_GYY"',
+                'User-Agent': 'Mozilla/5.0 (compatible; IETT-Bot/1.0)'
+            }
+            
+            logger.info(f"İBB DurakDetay_GYY çağrılıyor: {station_code}")
+            response = self.session.post(url, data=soap_body, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                buses = self.parse_ibb_xml_response(response.text, "DurakDetay")
+                if buses:
+                    return {
+                        "buses": buses,
+                        "station_name": None,
+                        "last_updated": get_istanbul_time().strftime("%H:%M")
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"DurakDetay_GYY hatası: {e}")
+            return None
+    
+    def call_get_stop_lines(self, station_code):
+        """GetStopLines_json methodunu çağırır"""
+        try:
+            url = "https://api.ibb.gov.tr/iett/ibb/ibb.asmx"
+            
+            # SOAP XML body oluştur
+            soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetStopLines_json xmlns="http://tempuri.org/">
+      <DurakKodu>{station_code}</DurakKodu>
+    </GetStopLines_json>
+  </soap:Body>
+</soap:Envelope>"""
+            
+            headers = {
+                'Content-Type': 'text/xml; charset=utf-8',
+                'SOAPAction': '"http://tempuri.org/GetStopLines_json"',
+                'User-Agent': 'Mozilla/5.0 (compatible; IETT-Bot/1.0)'
+            }
+            
+            logger.info(f"İBB GetStopLines_json çağrılıyor: {station_code}")
+            response = self.session.post(url, data=soap_body, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                # JSON yanıtını parse et
+                json_result = self.extract_json_from_soap_response(response.text)
+                if json_result:
+                    buses = self.parse_ibb_json_response(json_result, "StopLines")
+                    if buses:
+                        return {
+                            "buses": buses,
+                            "station_name": None,
+                            "last_updated": get_istanbul_time().strftime("%H:%M")
+                        }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"GetStopLines_json hatası: {e}")
+            return None
+    
+    def call_durak_cekmekoy(self, station_code):
+        """GetDurakCekmekoy_json methodunu çağırır"""
+        try:
+            url = "https://api.ibb.gov.tr/iett/UlasimAnaVeri/HatDurakGuzergah.asmx"
+            
+            # SOAP XML body oluştur
+            soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetDurakCekmekoy_json xmlns="http://tempuri.org/">
+      <DurakKodu>{station_code}</DurakKodu>
+    </GetDurakCekmekoy_json>
+  </soap:Body>
+</soap:Envelope>"""
+            
+            headers = {
+                'Content-Type': 'text/xml; charset=utf-8',
+                'SOAPAction': '"http://tempuri.org/GetDurakCekmekoy_json"',
+                'User-Agent': 'Mozilla/5.0 (compatible; IETT-Bot/1.0)'
+            }
+            
+            logger.info(f"İBB GetDurakCekmekoy_json çağrılıyor: {station_code}")
+            response = self.session.post(url, data=soap_body, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                # JSON yanıtını parse et
+                json_result = self.extract_json_from_soap_response(response.text)
+                if json_result:
+                    buses = self.parse_ibb_json_response(json_result, "DurakCekmekoy")
+                    if buses:
+                        return {
+                            "buses": buses,
+                            "station_name": None,
+                            "last_updated": get_istanbul_time().strftime("%H:%M")
+                        }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"GetDurakCekmekoy_json hatası: {e}")
+            return None
+    
+    def call_filo_durum(self, station_code):
+        """GetFiloDurum_json methodunu çağırır"""
+        try:
+            url = "https://api.ibb.gov.tr/iett/FiloDurum/SeferGerceklesme.asmx"
+            
+            # SOAP XML body oluştur
+            soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetFiloDurum_json xmlns="http://tempuri.org/">
+      <DurakKodu>{station_code}</DurakKodu>
+    </GetFiloDurum_json>
+  </soap:Body>
+</soap:Envelope>"""
+            
+            headers = {
+                'Content-Type': 'text/xml; charset=utf-8',
+                'SOAPAction': '"http://tempuri.org/GetFiloDurum_json"',
+                'User-Agent': 'Mozilla/5.0 (compatible; IETT-Bot/1.0)'
+            }
+            
+            logger.info(f"İBB GetFiloDurum_json çağrılıyor: {station_code}")
+            response = self.session.post(url, data=soap_body, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                # JSON yanıtını parse et
+                json_result = self.extract_json_from_soap_response(response.text)
+                if json_result:
+                    buses = self.parse_ibb_json_response(json_result, "FiloDurum")
+                    if buses:
+                        return {
+                            "buses": buses,
+                            "station_name": None,
+                            "last_updated": get_istanbul_time().strftime("%H:%M")
+                        }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"GetFiloDurum_json hatası: {e}")
+            return None
+    
+    def parse_ibb_xml_response(self, xml_content, response_type):
+        """İBB XML yanıtını parse eder"""
+        buses = []
+        try:
+            from xml.etree import ElementTree as ET
+            
+            # XML namespace'leri kaldır ve parse et
+            clean_xml = re.sub(r'xmlns[^=]*="[^"]*"', '', xml_content)
+            root = ET.fromstring(clean_xml)
+            
+            # Farklı XML yapılarını destekle
+            bus_elements = (
+                root.findall('.//Bus') or 
+                root.findall('.//Otobüs') or 
+                root.findall('.//Hat') or
+                root.findall('.//Line') or
+                root.findall('.//Item')
+            )
+            
+            current_time = get_istanbul_time()
+            
+            for elem in bus_elements:
+                line = None
+                direction = None
+                minutes = 5
+                
+                # Farklı XML tag isimlerini kontrol et
+                for child in elem:
+                    tag = child.tag.lower()
+                    text = child.text or ""
+                    
+                    if any(keyword in tag for keyword in ['hat', 'line', 'route']):
+                        line = text.strip()
+                    elif any(keyword in tag for keyword in ['yön', 'yon', 'direction', 'destination']):
+                        direction = text.strip()
+                    elif any(keyword in tag for keyword in ['dk', 'dakika', 'minute', 'time']):
+                        try:
+                            minutes = int(re.search(r'\d+', text).group()) if re.search(r'\d+', text) else 5
+                        except:
+                            minutes = 5
+                
+                # Line elementin text'i olabilir
+                if not line and elem.text:
+                    line_match = re.search(r'(\d+[A-Z]?)', elem.text)
+                    if line_match:
+                        line = line_match.group(1)
+                
+                if line:
+                    arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                    buses.append({
+                        "line": line,
+                        "direction": direction or f"Hat {line}",
+                        "arrival_time": arrival_time,
+                        "estimated_minutes": minutes
+                    })
+                    logger.debug(f"İBB XML parse: {line} - {minutes} dk - {direction}")
+            
+            return buses
+            
+        except Exception as e:
+            logger.error(f"İBB XML parsing hatası: {e}")
+            return []
+    
+    def extract_json_from_soap_response(self, soap_xml):
+        """SOAP yanıtından JSON'u çıkarır"""
+        try:
+            # SOAP yanıtındaki JSON string'i bul
+            json_pattern = r'<[^>]*Result[^>]*>(\{.*?\})</[^>]*Result[^>]*>'
+            match = re.search(json_pattern, soap_xml, re.DOTALL)
+            
+            if match:
+                json_str = match.group(1)
+                # HTML entity'leri decode et
+                json_str = json_str.replace('&quot;', '"').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                return json.loads(json_str)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"SOAP JSON çıkarma hatası: {e}")
+            return None
+    
+    def parse_ibb_json_response(self, json_data, response_type):
+        """İBB JSON yanıtını parse eder"""
+        buses = []
+        try:
+            current_time = get_istanbul_time()
+            
+            # JSON yapısını kontrol et
+            items = []
+            
+            if isinstance(json_data, list):
+                items = json_data
+            elif isinstance(json_data, dict):
+                # Farklı anahtar isimlerini kontrol et
+                for key in ['data', 'result', 'items', 'buses', 'hatlar', 'lines']:
+                    if key in json_data:
+                        items = json_data[key] if isinstance(json_data[key], list) else [json_data[key]]
+                        break
+                
+                # Eğer hiçbiri yoksa direkt obje olabilir
+                if not items and json_data:
+                    items = [json_data]
+            
+            for item in items:
+                if isinstance(item, dict):
+                    # Farklı JSON field isimlerini kontrol et
+                    line = (
+                        item.get('HatKodu') or item.get('hat_kodu') or 
+                        item.get('LineCode') or item.get('line') or 
+                        item.get('Route') or item.get('route') or ""
+                    )
+                    
+                    direction = (
+                        item.get('YonAdi') or item.get('yon_adi') or 
+                        item.get('Direction') or item.get('direction') or 
+                        item.get('Destination') or item.get('destination') or ""
+                    )
+                    
+                    # Dakika bilgisi
+                    minutes = 5
+                    for min_key in ['Dakika', 'dakika', 'dk', 'Minute', 'minute', 'EstimatedMinutes']:
+                        if min_key in item:
+                            try:
+                                minutes = int(item[min_key])
+                                break
+                            except:
+                                continue
+                    
+                    if line:
+                        arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                        buses.append({
+                            "line": str(line).strip(),
+                            "direction": str(direction).strip() if direction else f"Hat {line}",
+                            "arrival_time": arrival_time,
+                            "estimated_minutes": minutes
+                        })
+                        logger.debug(f"İBB JSON parse: {line} - {minutes} dk - {direction}")
+            
+            return buses
+            
+        except Exception as e:
+            logger.error(f"İBB JSON parsing hatası: {e}")
+            return []
+    
+    def advanced_scrape_station(self, station_code):
+        """Gelişmiş web scraping stratejisi"""
+        try:
+            # Farklı URL formatları
+            urls = [
+                f"https://iett.istanbul/StationDetail?dkod={station_code}",
+                f"https://iett.istanbul/DurakDetay?dk={station_code}",
+                f"https://www.iett.istanbul/tr/main/pages/durak-detay/5/{station_code}"
+            ]
+            
+            # Farklı User-Agent'lar
+            user_agents = [
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15',
+                'Mozilla/5.0 (Android 11; Mobile; rv:68.0) Gecko/68.0 Firefox/88.0',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ]
+            
+            for url in urls:
+                for user_agent in user_agents:
+                    try:
+                        headers = {
+                            'User-Agent': user_agent,
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'tr-TR,tr;q=0.8,en;q=0.5',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'Connection': 'keep-alive'
+                        }
+                        
+                        response = self.session.get(url, headers=headers, timeout=12)
+                        
+                        if response.status_code == 200:
+                            soup = BeautifulSoup(response.text, 'html.parser')
+                            
+                            # Farklı parse stratejileri
+                            parse_methods = [
+                                self.parse_json_embedded_data,
+                                self.parse_table_data_enhanced,
+                                self.parse_div_structure_enhanced
+                            ]
+                            
+                            for parse_method in parse_methods:
+                                buses = parse_method(soup, station_code)
+                                if buses:
+                                    station_name = self.extract_station_name_from_html(soup)
+                                    return {
+                                        "buses": buses,
+                                        "station_name": station_name,
+                                        "last_updated": get_istanbul_time().strftime("%H:%M")
+                                    }
+                    
+                    except Exception as e:
+                        logger.debug(f"Advanced scraping attempt failed: {e}")
+                        continue
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Advanced scraping error: {e}")
+            return None
+    
+    def try_mobile_apis(self, station_code):
+        """Mobil API'leri dener"""
+        try:
+            mobile_apis = [
+                f"https://m.iett.istanbul/api/durak/{station_code}",
+                f"https://mobil.iett.gov.tr/api/stationinfo/{station_code}",
+                f"https://api.iett.gov.tr/mobile/station/{station_code}",
+                f"https://servis.iett.gov.tr/api/GetDurakBilgi?dkod={station_code}"
+            ]
+            
+            headers = {
+                'User-Agent': 'IETT-Mobile-App/1.0 (iOS)',
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+            
+            for api_url in mobile_apis:
+                try:
+                    response = self.session.get(api_url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        # JSON parse
+                        try:
+                            data = response.json()
+                            buses = self.parse_mobile_api_response(data, station_code)
+                            if buses:
+                                return {
+                                    "buses": buses,
+                                    "station_name": None,
+                                    "last_updated": get_istanbul_time().strftime("%H:%M")
+                                }
+                        except json.JSONDecodeError:
+                            # XML veya HTML olabilir
+                            buses = self.parse_non_json_mobile_response(response.text, station_code)
+                            if buses:
+                                return {
+                                    "buses": buses,
+                                    "station_name": None,
+                                    "last_updated": get_istanbul_time().strftime("%H:%M")
+                                }
+                
+                except Exception as e:
+                    logger.debug(f"Mobile API {api_url} hatası: {e}")
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Mobile APIs error: {e}")
+            return None
+    
+    def try_alternative_sources(self, station_code):
+        """Alternatif kaynakları dener"""
+        try:
+            # Gerçek olmayan siteler, sadece example
+            return None
+            
+        except Exception as e:
+            logger.error(f"Alternative sources error: {e}")
+            return None
+    
+    def parse_json_embedded_data(self, soup, station_code):
+        """HTML içindeki embedded JSON'u parse eder"""
+        buses = []
+        try:
+            # Script taglerinde JSON arama
+            scripts = soup.find_all('script')
+            
+            for script in scripts:
+                if script.string:
+                    # Farklı JSON pattern'leri
+                    patterns = [
+                        r'var\s+stationData\s*=\s*(\{.*?\});',
+                        r'window\.stationInfo\s*=\s*(\{.*?\});',
+                        r'arrivals\s*:\s*(\[.*?\])',
+                        r'busData\s*=\s*(\[.*?\]);'
+                    ]
+                    
+                    for pattern in patterns:
+                        matches = re.findall(pattern, script.string, re.DOTALL)
+                        for match in matches:
+                            try:
+                                data = json.loads(match)
+                                parsed_buses = self.parse_embedded_json_data(data)
+                                buses.extend(parsed_buses)
+                            except:
+                                continue
+            
+            return buses if buses else None
+            
+        except Exception as e:
+            logger.debug(f"JSON embedded parsing error: {e}")
+            return None
+    
+    def parse_table_data_enhanced(self, soup, station_code):
+        """Gelişmiş tablo parsing"""
+        buses = []
+        try:
+            # Tüm tabloları bul
+            tables = soup.find_all('table')
+            
+            for table in tables:
+                table_text = table.get_text().lower()
+                
+                # Otobüs verisine sahip tablo mu kontrol et
+                if any(word in table_text for word in ['hat', 'line', 'dakika', 'dk', 'saat']):
+                    rows = table.find_all('tr')
+                    
+                    for row in rows:
+                        cells = row.find_all(['td', 'th'])
+                        
+                        if len(cells) >= 2:
+                            # Hat numarası ve zaman bilgisi çıkar
+                            for i, cell in enumerate(cells):
+                                cell_text = cell.get_text(strip=True)
+                                
+                                # Hat numarası pattern'i
+                                if re.match(r'^\d{1,3}[A-Z]?$', cell_text):
+                                    line = cell_text
+                                    
+                                    # Sonraki hücrelerde zaman bilgisi ara
+                                    for j in range(i + 1, len(cells)):
+                                        next_cell = cells[j].get_text(strip=True)
+                                        
+                                        # Dakika bilgisi
+                                        time_match = re.search(r'(\d+)\s*(?:dk|dakika)', next_cell)
+                                        if time_match:
+                                            minutes = int(time_match.group(1))
+                                            current_time = get_istanbul_time()
+                                            arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                                            
+                                            buses.append({
+                                                "line": line,
+                                                "direction": f"Hat {line}",
+                                                "arrival_time": arrival_time,
+                                                "estimated_minutes": minutes
+                                            })
+                                            break
+            
+            return buses if buses else None
+            
+        except Exception as e:
+            logger.debug(f"Enhanced table parsing error: {e}")
+            return None
+    
+    def parse_div_structure_enhanced(self, soup, station_code):
+        """Gelişmiş div yapısı parsing"""
+        buses = []
+        try:
+            # Otobüs bilgileri içeren div'leri bul
+            bus_containers = soup.find_all(['div', 'section', 'article'], 
+                                         class_=re.compile(r'bus|arrival|line|otobüs', re.I))
+            
+            if not bus_containers:
+                # Class olmadan da ara
+                all_divs = soup.find_all('div')
+                bus_containers = [div for div in all_divs 
+                                if any(word in div.get_text().lower() 
+                                      for word in ['hat', 'dk', 'dakika', 'sefer'])]
+            
+            for container in bus_containers:
+                container_text = container.get_text()
+                
+                # Hat numarası + dakika pattern'i
+                pattern = r'(\d{1,3}[A-Z]?).{0,50}?(\d{1,2})\s*(?:dk|dakika)'
+                matches = re.findall(pattern, container_text)
+                
+                for line, minutes_str in matches:
+                    minutes = int(minutes_str)
+                    current_time = get_istanbul_time()
+                    arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                    
+                    buses.append({
+                        "line": line,
+                        "direction": f"Hat {line}",
+                        "arrival_time": arrival_time,
+                        "estimated_minutes": minutes
+                    })
+            
+            return buses if buses else None
+            
+        except Exception as e:
+            logger.debug(f"Enhanced div parsing error: {e}")
+            return None
+    
+    def parse_embedded_json_data(self, data):
+        """Embedded JSON verisini parse eder"""
+        buses = []
+        try:
+            current_time = get_istanbul_time()
+            
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get('arrivals', data.get('buses', data.get('data', [data])))
+            else:
+                items = []
+            
+            for item in items:
+                if isinstance(item, dict):
+                    line = item.get('line', item.get('hatKodu', item.get('lineCode', '')))
+                    minutes = item.get('dk', item.get('dakika', item.get('minutes', 5)))
+                    direction = item.get('yon', item.get('direction', ''))
+                    
+                    if line:
+                        arrival_time = (current_time + timedelta(minutes=int(minutes))).strftime("%H:%M")
+                        buses.append({
+                            "line": str(line),
+                            "direction": direction or f"Hat {line}",
+                            "arrival_time": arrival_time,
+                            "estimated_minutes": int(minutes)
+                        })
+            
+            return buses
+            
+        except Exception as e:
+            logger.debug(f"Embedded JSON data parsing error: {e}")
+            return []
+    
+    def parse_mobile_api_response(self, data, station_code):
+        """Mobil API yanıtını parse eder"""
+        return self.parse_ajax_response(data, station_code)
+    
+    def parse_non_json_mobile_response(self, content, station_code):
+        """JSON olmayan mobil API yanıtını parse eder"""
+        buses = []
+        try:
+            # XML olabilir
+            if content.strip().startswith('<'):
+                return self.parse_xml_response(content, station_code)
+            
+            # Plain text pattern'leri
+            lines = content.split('\n')
+            for line in lines:
+                line_match = re.search(r'(\d{1,3}[A-Z]?)', line)
+                time_match = re.search(r'(\d{1,2})\s*(?:dk|min)', line)
+                
+                if line_match and time_match:
+                    line_num = line_match.group(1)
+                    minutes = int(time_match.group(1))
+                    current_time = get_istanbul_time()
+                    arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                    
+                    buses.append({
+                        "line": line_num,
+                        "direction": f"Hat {line_num}",
+                        "arrival_time": arrival_time,
+                        "estimated_minutes": minutes
+                    })
+            
+            return buses
+            
+        except Exception as e:
+            logger.debug(f"Non-JSON mobile response parsing error: {e}")
+            return []
     
     def parse_ajax_response(self, data, station_code):
         """AJAX yanıtını parse eder"""
@@ -1150,7 +1810,120 @@ class IETTBot:
             return []
     
     def get_route_schedule(self, bus_line, station_name=None):
-        """Bir hat için RouteDetail sayfasından kalkış saatlerini alır"""
+        """Bir hat için kalkış saatlerini alır"""
+        try:
+            # Önce İBB API'lerini dene
+            ibb_schedule = self.get_ibb_route_schedule(bus_line, station_name)
+            if ibb_schedule:
+                logger.info(f"Hat {bus_line} için İBB API'den {len(ibb_schedule)} saat bulundu")
+                return ibb_schedule
+            
+            # Fallback: Web scraping
+            return self.get_web_route_schedule(bus_line, station_name)
+            
+        except Exception as e:
+            logger.error(f"Hat {bus_line} için sefer saatleri alınamadı: {e}")
+            return None
+    
+    def get_ibb_route_schedule(self, bus_line, station_name=None):
+        """İBB API'lerinden hat kalkış saatlerini alır"""
+        try:
+            # Hat bilgilerini İBB API'den al
+            url = "https://api.ibb.gov.tr/iett/UlasimAnaVeri/HatDurakGuzergah.asmx"
+            
+            # SOAP XML body oluştur
+            soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetHatCekmekoy_json xmlns="http://tempuri.org/">
+      <HatKodu>{bus_line}</HatKodu>
+    </GetHatCekmekoy_json>
+  </soap:Body>
+</soap:Envelope>"""
+            
+            headers = {
+                'Content-Type': 'text/xml; charset=utf-8',
+                'SOAPAction': '"http://tempuri.org/GetHatCekmekoy_json"',
+                'User-Agent': 'Mozilla/5.0 (compatible; IETT-Bot/1.0)'
+            }
+            
+            logger.info(f"İBB API'den hat {bus_line} bilgileri alınıyor...")
+            response = self.session.post(url, data=soap_body, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                # JSON yanıtını parse et
+                json_result = self.extract_json_from_soap_response(response.text)
+                if json_result:
+                    schedules = self.parse_ibb_schedule_response(json_result, station_name)
+                    if schedules:
+                        return schedules
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"İBB API hat schedule hatası: {e}")
+            return None
+    
+    def parse_ibb_schedule_response(self, json_data, station_name=None):
+        """İBB API'den gelen hat bilgilerini kalkış saatleri formatına çevirir"""
+        schedules = []
+        try:
+            # JSON yapısını kontrol et
+            if isinstance(json_data, dict) and 'data' in json_data:
+                data = json_data['data']
+            elif isinstance(json_data, list):
+                data = json_data
+            else:
+                data = [json_data] if json_data else []
+            
+            for item in data if isinstance(data, list) else [data]:
+                if isinstance(item, dict):
+                    # Sefer saatlerini bul
+                    for key, value in item.items():
+                        if 'saat' in key.lower() or 'time' in key.lower():
+                            if isinstance(value, str):
+                                # Saat formatlarını bul
+                                time_matches = re.findall(r'\b([0-2]?[0-9]:[0-5][0-9])\b', value)
+                                for time_match in time_matches:
+                                    schedules.append({
+                                        'station': station_name or 'Durak',
+                                        'time': time_match,
+                                        'direction': 'Kalkış'
+                                    })
+                            elif isinstance(value, list):
+                                # List içindeki saat bilgileri
+                                for time_item in value:
+                                    if isinstance(time_item, str):
+                                        time_matches = re.findall(r'\b([0-2]?[0-9]:[0-5][0-9])\b', time_item)
+                                        for time_match in time_matches:
+                                            schedules.append({
+                                                'station': station_name or 'Durak',
+                                                'time': time_match,
+                                                'direction': 'Kalkış'
+                                            })
+                    
+                    # Eğer direkt saat array'i varsa
+                    if 'schedules' in item or 'kalkis_saatleri' in item:
+                        times_array = item.get('schedules') or item.get('kalkis_saatleri')
+                        if isinstance(times_array, list):
+                            for time_str in times_array:
+                                if isinstance(time_str, str) and re.match(r'\d{1,2}:\d{2}', time_str):
+                                    schedules.append({
+                                        'station': station_name or 'Durak',
+                                        'time': time_str,
+                                        'direction': 'Kalkış'
+                                    })
+            
+            return schedules if schedules else None
+            
+        except Exception as e:
+            logger.error(f"İBB schedule response parsing hatası: {e}")
+            return None
+    
+    def get_web_route_schedule(self, bus_line, station_name=None):
+        """Web scraping ile hat kalkış saatlerini alır (fallback)"""
         try:
             # Önce hat arama yaparak route bilgisini bul
             search_url = f"https://iett.istanbul/SearchRoute?searchText={bus_line}"
@@ -1191,7 +1964,7 @@ class IETTBot:
             return schedule_data
             
         except Exception as e:
-            logger.error(f"Hat {bus_line} için sefer saatleri alınamadı: {e}")
+            logger.error(f"Web route schedule hatası: {e}")
             return None
     
     def parse_departure_times_body(self, soup, target_station_name=None):
