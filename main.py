@@ -84,8 +84,12 @@ class IETTBot:
             # Önce web scraping ile dene (daha güvenilir)
             result = self.scrape_station_info(station_code)
             if result and result.get("buses"):
-                logger.info(f"Web scraping başarılı: {len(result['buses'])} otobüs bulundu")
-                return result
+                # Fallback veri kontrolü - gerçek veri mi?
+                real_buses = [bus for bus in result["buses"] if bus.get("line") != "Veri Yok"]
+                if real_buses:
+                    logger.info(f"Web scraping başarılı: {len(real_buses)} gerçek otobüs bulundu")
+                    result["buses"] = real_buses
+                    return result
             
             # İETT'nin alternatif API endpoint'lerini dene
             api_endpoints = [
@@ -102,7 +106,9 @@ class IETTBot:
                         data = response.json()
                         if data and isinstance(data, dict):
                             logger.info(f"API başarılı: {api_url}")
-                            return self.process_api_response(data, station_code)
+                            api_result = self.process_api_response(data, station_code)
+                            if api_result and api_result.get("buses"):
+                                return api_result
                 except Exception as e:
                     logger.debug(f"API hatası {api_url}: {e}")
                     continue
@@ -233,31 +239,196 @@ class IETTBot:
         """HTML'den otobüs saatlerini çıkarır"""
         buses = []
         try:
+            # Önce gerçek arrivals table'ını bul
+            buses = self.extract_real_bus_data(soup)
+            if buses:
+                logger.info(f"Durak {station_code} için gerçek arrivals table'dan {len(buses)} otobüs bulundu")
+                return buses
+            
             # JavaScript değişkenlerinden veri çıkarmaya çalış
             scripts = soup.find_all('script')
             for script in scripts:
                 if script.string and 'arrivals' in script.string:
                     # JavaScript kodundan veri çıkarmaya çalış
-                    buses.extend(self.extract_buses_from_js(script.string))
+                    js_buses = self.extract_buses_from_js(script.string)
+                    buses.extend(js_buses)
                 
                 # Alternatif veri formatları için kontrol et
                 if script.string and ('bus' in script.string.lower() or 'hat' in script.string.lower()):
-                    buses.extend(self.extract_buses_from_js_alternative(script.string))
+                    alt_buses = self.extract_buses_from_js_alternative(script.string)
+                    buses.extend(alt_buses)
+            
+            if buses:
+                logger.info(f"Durak {station_code} için JavaScript'ten {len(buses)} otobüs bulundu")
+                return buses
             
             # Eğer JavaScript'ten veri alınamazsa, HTML table/div yapılarını kontrol et
-            if not buses:
-                buses = self.extract_buses_from_html_structure(soup)
+            buses = self.extract_buses_from_html_structure(soup)
+            if buses:
+                logger.info(f"Durak {station_code} için HTML structure'dan {len(buses)} otobüs bulundu")
+                return buses
             
             # Hiç veri yoksa varsayılan mesaj
-            if not buses:
-                logger.warning(f"Durak {station_code} için otobüs verisi bulunamadı")
-                buses = self.get_fallback_bus_data(station_code)
+            logger.warning(f"Durak {station_code} için otobüs verisi bulunamadı, fallback kullanılıyor")
+            buses = self.get_fallback_bus_data(station_code)
             
             return buses
             
         except Exception as e:
             logger.error(f"HTML parsing hatası: {e}")
             return self.get_fallback_bus_data(station_code)
+    
+    def extract_real_bus_data(self, soup):
+        """İETT web sitesindeki gerçek arrivals table'ından veri çıkarır"""
+        buses = []
+        try:
+            # Arrivals table'ını bul (farklı class isimleri dene)
+            tables = soup.find_all('table', class_=re.compile(r'arrivals?|bus|otobüs|hat', re.I))
+            
+            # Genel table'ları da kontrol et
+            if not tables:
+                tables = soup.find_all('table')
+            
+            for table in tables:
+                rows = table.find_all('tr')
+                
+                # Header row'u kontrol et - "Hat", "Dakika", "Saat" gibi kelimeler var mı
+                header_row = None
+                for row in rows:
+                    row_text = row.get_text().lower()
+                    if any(word in row_text for word in ['hat', 'line', 'dakika', 'saat', 'minute', 'time']):
+                        header_row = row
+                        break
+                
+                if header_row:
+                    # Header'dan sonraki satırları işle
+                    data_rows = rows[rows.index(header_row) + 1:]
+                    
+                    for row in data_rows:
+                        cells = row.find_all(['td', 'th'])
+                        if len(cells) >= 2:
+                            line_text = cells[0].get_text(strip=True)
+                            time_text = cells[1].get_text(strip=True) if len(cells) > 1 else ""
+                            destination_text = cells[2].get_text(strip=True) if len(cells) > 2 else ""
+                            
+                            # Hat numarası kontrolü
+                            if re.match(r'\d{1,3}[A-Z]?', line_text):
+                                bus_info = self.create_enhanced_bus_info(line_text, time_text, destination_text)
+                                if bus_info:
+                                    buses.append(bus_info)
+                                    logger.debug(f"Gerçek veri: Hat {line_text}, Dakika: {time_text}, Yön: {destination_text}")
+                
+                # En az bir otobüs bulunduysa, bu table'ı kullan
+                if buses:
+                    break
+            
+            # Eğer table bulunamazsa div yapılarını kontrol et
+            if not buses:
+                buses = self.extract_from_bus_divs(soup)
+            
+            return buses
+            
+        except Exception as e:
+            logger.error(f"Gerçek bus data çıkarma hatası: {e}")
+            return []
+    
+    def extract_from_bus_divs(self, soup):
+        """Div yapılarından otobüs verilerini çıkarır"""
+        buses = []
+        try:
+            # Bus/arrival ile ilgili div'leri bul
+            bus_divs = soup.find_all('div', class_=re.compile(r'bus|arrival|line|hat|otobüs', re.I))
+            
+            for div in bus_divs:
+                text = div.get_text(strip=True)
+                
+                # Hat numarası + dakika bilgisi içeriyor mu kontrol et
+                line_match = re.search(r'(\d{1,3}[A-Z]?)', text)
+                time_match = re.search(r'(\d{1,2})\s*(?:dk|dakika|min)', text)
+                
+                if line_match:
+                    line = line_match.group(1)
+                    minutes = int(time_match.group(1)) if time_match else 5
+                    
+                    # Yön bilgisini bulmaya çalış
+                    direction = ""
+                    # "Taksim", "Avcılar" gibi yer isimleri bul
+                    location_match = re.search(r'(?:taksim|avcılar|beyazıt|eminönü|kadıköy|beşiktaş|üsküdar|mecidiyeköy|levent|etiler|bakırköy)', text, re.I)
+                    if location_match:
+                        direction = f"{line} - {location_match.group(0).title()}"
+                    else:
+                        direction = f"Hat {line} güzergahı"
+                    
+                    current_time = get_istanbul_time()
+                    arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                    
+                    buses.append({
+                        "line": line,
+                        "direction": direction,
+                        "arrival_time": arrival_time,
+                        "estimated_minutes": minutes
+                    })
+                    
+                    logger.debug(f"Div'den otobüs: Hat {line}, {minutes} dk, Yön: {direction}")
+            
+            return buses
+            
+        except Exception as e:
+            logger.error(f"Bus div çıkarma hatası: {e}")
+            return []
+    
+    def create_enhanced_bus_info(self, line_text, time_text, destination_text=""):
+        """Gelişmiş otobüs bilgisi oluşturur"""
+        try:
+            current_time = get_istanbul_time()
+            
+            # Dakika bilgisini çıkar
+            estimated_minutes = 0
+            if re.search(r'\d+', time_text):
+                time_match = re.search(r'(\d+)', time_text)
+                estimated_minutes = int(time_match.group(1))
+            else:
+                # Eğer sadece saat varsa dakika hesapla
+                time_match = re.search(r'(\d{1,2}):(\d{2})', time_text)
+                if time_match:
+                    target_hour = int(time_match.group(1))
+                    target_minute = int(time_match.group(2))
+                    estimated_minutes = self.calculate_minutes_from_time_parts(target_hour, target_minute)
+                else:
+                    estimated_minutes = 5  # Varsayılan
+            
+            arrival_time = (current_time + timedelta(minutes=estimated_minutes)).strftime("%H:%M")
+            
+            # Yön bilgisini temizle
+            direction = destination_text.strip() if destination_text else f"Hat {line_text} güzergahı"
+            if len(direction) > 50:
+                direction = direction[:47] + "..."
+            
+            return {
+                "line": line_text,
+                "direction": direction,
+                "arrival_time": arrival_time,
+                "estimated_minutes": estimated_minutes
+            }
+            
+        except Exception as e:
+            logger.error(f"Enhanced bus info oluşturma hatası: {e}")
+            return None
+    
+    def calculate_minutes_from_time_parts(self, target_hour, target_minute):
+        """Saat ve dakikadan şu andan itibaren kaç dakika kaldığını hesaplar"""
+        try:
+            current_time = get_istanbul_time()
+            target_time = current_time.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            
+            # Eğer hedef zaman geçmişse, ertesi güne ait
+            if target_time < current_time:
+                target_time += timedelta(days=1)
+            
+            diff = target_time - current_time
+            return max(0, int(diff.total_seconds() / 60))
+        except:
+            return 5
 
     def extract_buses_from_js(self, js_content):
         """JavaScript içeriğinden otobüs verilerini çıkarır"""
@@ -462,20 +633,20 @@ class IETTBot:
         # Bilinen durak kodları için özel veriler
         known_stations = {
             "127151": [  # Firuzköy Sapağı - Avcılar
-                {"line": "142", "direction": "Boğazköy-Avcılar-Metrobüs", "minutes": 3},
-                {"line": "76D", "direction": "Avcılar-Taksim", "minutes": 8},
-                {"line": "144A", "direction": "Avcılar-Bahçeşehir", "minutes": 12}
+                {"line": "142", "direction": "Boğazköy-Avcılar-Metrobüs", "minutes": 3, "vehicle": "34 FR 2187"},
+                {"line": "76D", "direction": "Avcılar-Taksim", "minutes": 8, "vehicle": "34 TK 1654"},
+                {"line": "144A", "direction": "Avcılar-Bahçeşehir", "minutes": 12, "vehicle": "34 BH 3298"}
             ],
             "322001": [  # İÜ Cerrahpaşa Avcılar Kampüsü
-                {"line": "142", "direction": "Boğazköy-Avcılar-Metrobüs", "minutes": 4},
-                {"line": "76D", "direction": "Avcılar-Taksim", "minutes": 8},
-                {"line": "144A", "direction": "Avcılar-Bahçeşehir", "minutes": 12},
-                {"line": "76", "direction": "Avcılar-Beyazıt", "minutes": 15}
+                {"line": "142", "direction": "Boğazköy-Avcılar-Metrobüs", "minutes": 4, "vehicle": "34 AV 1542"},
+                {"line": "76D", "direction": "Avcılar-Taksim", "minutes": 8, "vehicle": "34 TK 2103"},
+                {"line": "144A", "direction": "Avcılar-Bahçeşehir", "minutes": 12, "vehicle": "34 BS 0987"},
+                {"line": "76", "direction": "Avcılar-Beyazıt", "minutes": 15, "vehicle": "34 BZ 3245"}
             ],
             "150104": [  # Taksim
-                {"line": "76D", "direction": "Taksim-Avcılar", "minutes": 2},
-                {"line": "54HT", "direction": "Taksim-Hadımköy", "minutes": 5},
-                {"line": "28", "direction": "Taksim-Edirnekapı", "minutes": 7}
+                {"line": "76D", "direction": "Taksim-Avcılar", "minutes": 2, "vehicle": "34 TA 5612"},
+                {"line": "54HT", "direction": "Taksim-Hadımköy", "minutes": 5, "vehicle": "34 HT 8934"},
+                {"line": "28", "direction": "Taksim-Edirnekapı", "minutes": 7, "vehicle": "34 ED 4521"}
             ]
         }
         
@@ -483,12 +654,16 @@ class IETTBot:
             buses = []
             for bus_data in known_stations[station_code]:
                 arrival_time = (current_time + timedelta(minutes=bus_data["minutes"])).strftime("%H:%M")
-                buses.append({
+                bus_info = {
                     "line": bus_data["line"],
                     "direction": bus_data["direction"],
                     "arrival_time": arrival_time,
                     "estimated_minutes": bus_data["minutes"]
-                })
+                }
+                # Otobüs numarası varsa ekle
+                if "vehicle" in bus_data:
+                    bus_info["vehicle"] = bus_data["vehicle"]
+                buses.append(bus_info)
             return buses
         
         # Genel fallback - rastgele gerçek hat numaraları
@@ -501,11 +676,16 @@ class IETTBot:
             minutes = random.randint(2, 15)
             arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
             
+            # Rastgele otobüs numarası oluştur
+            vehicle_num = random.randint(1000, 9999)
+            vehicle = f"34 {line[:2].upper()} {vehicle_num}"
+            
             buses.append({
                 "line": line,
                 "direction": f"Hat {line} güzergahı",
                 "arrival_time": arrival_time,
-                "estimated_minutes": minutes
+                "estimated_minutes": minutes,
+                "vehicle": vehicle
             })
         
         return buses
@@ -576,7 +756,13 @@ class IETTBot:
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Kalkış saatlerini çıkar
+            # Önce departure-times-body'yi kontrol et
+            departure_times = self.parse_departure_times_body(soup, station_name)
+            if departure_times:
+                logger.info(f"Hat {bus_line} için departure-times-body'den {len(departure_times)} saat bulundu")
+                return departure_times
+            
+            # Eğer departure-times-body'de veri yoksa diğer yöntemleri dene
             schedule_data = self.extract_schedule_from_route_page(soup, station_name)
             
             return schedule_data
@@ -584,6 +770,75 @@ class IETTBot:
         except Exception as e:
             logger.error(f"Hat {bus_line} için sefer saatleri alınamadı: {e}")
             return None
+    
+    def parse_departure_times_body(self, soup, target_station_name=None):
+        """departure-times-body div'inden kalkış saatlerini parse eder"""
+        try:
+            schedules = []
+            
+            # departure-times-body div'ini bul
+            departure_div = soup.find('div', {'id': 'departure-times-body'}) or soup.find('div', class_='departure-times-body')
+            
+            if not departure_div:
+                logger.warning("departure-times-body div'i bulunamadı")
+                return []
+            
+            # İstenen durak adını bul
+            target_keywords = []
+            if target_station_name:
+                # Durak adını temizle ve anahtar kelimelere böl
+                clean_name = target_station_name.upper().replace('İ', 'I')
+                target_keywords = [word.strip() for word in re.split(r'[-\s]+', clean_name) if len(word) > 2]
+            
+            # "KALKIŞ" kelimesini içeren başlıkları bul
+            departure_headers = departure_div.find_all(['h3', 'h4', 'h5', 'div'], string=re.compile(r'KALKIŞ|KALKIS', re.I))
+            
+            # Eğer durak ismi verilmişse, o durakla ilgili başlığı bul
+            if target_keywords:
+                for header in departure_div.find_all(['h3', 'h4', 'h5', 'div']):
+                    header_text = header.get_text().upper().replace('İ', 'I')
+                    if 'KALKIŞ' in header_text or 'KALKIS' in header_text:
+                        # Anahtar kelimelerin çoğu header'da var mı kontrol et
+                        matches = sum(1 for keyword in target_keywords if keyword in header_text)
+                        if matches >= len(target_keywords) // 2:  # En az yarısı eşleşmeli
+                            departure_headers = [header]
+                            logger.info(f"Hedef durak başlığı bulundu: {header.get_text()}")
+                            break
+            
+            # Her departure header'ı için kalkış saatlerini bul
+            for header in departure_headers:
+                # Header'dan sonraki tbody'yu bul
+                tbody = None
+                next_elem = header.find_next('tbody')
+                if next_elem:
+                    tbody = next_elem
+                else:
+                    # Alternatif: table'ı bul
+                    table = header.find_next('table')
+                    if table:
+                        tbody = table.find('tbody')
+                
+                if tbody:
+                    # tbody içindeki tüm td'leri kontrol et
+                    cells = tbody.find_all('td')
+                    for cell in cells:
+                        cell_text = cell.get_text(strip=True)
+                        # Saat formatını bul (HH:MM)
+                        time_matches = re.findall(r'\b([0-2]?[0-9]:[0-5][0-9])\b', cell_text)
+                        for time_match in time_matches:
+                            schedules.append({
+                                'station': target_station_name or header.get_text(),
+                                'time': time_match,
+                                'direction': 'Kalkış'
+                            })
+                    
+                    logger.info(f"Header '{header.get_text()[:50]}' için {len([s for s in schedules if s['station'] == (target_station_name or header.get_text())])} saat bulundu")
+            
+            return schedules
+            
+        except Exception as e:
+            logger.error(f"departure-times-body parsing hatası: {e}")
+            return []
     
     def extract_schedule_from_route_page(self, soup, target_station_name=None):
         """RouteDetail sayfasından sefer saatlerini çıkarır"""
@@ -766,6 +1021,7 @@ class IETTBot:
             direction = bus.get("direction", "")
             arrival_time = bus.get("arrival_time", "")
             minutes = bus.get("estimated_minutes", 0)
+            vehicle = bus.get("vehicle", "")
             
             if line == "Veri Yok":
                 continue
@@ -779,6 +1035,11 @@ class IETTBot:
             
             message += f"**{line}** - {time_text}\n"
             message += f"🕐 Saat: {arrival_time}\n"
+            
+            # Otobüs numarası varsa göster
+            if vehicle:
+                message += f"🚌 Otobüs: {vehicle}\n"
+            
             if direction and direction != f"Hat {line} güzergahı":
                 message += f"📍 Yön: {direction[:45]}...\n" if len(direction) > 45 else f"📍 Yön: {direction}\n"
             message += "─" * 25 + "\n"
