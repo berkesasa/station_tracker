@@ -214,7 +214,7 @@ Bu bot, İstanbul'daki otobüs duraklarından yaklaşan otobüsleri gösterir.
 **Komutlar:**
 • `/durak <kod>` - Yeni durak ayarla
 • `/otobusler` veya `/bus` - Kayıtlı durağı sorgula
-• `/durağım` - Hangi durak kayıtlı göster
+• `/duragim` - Hangi durak kayıtlı göster
 • `/yardim` - Detaylı yardım
 
 **Örnek:**
@@ -237,7 +237,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • `/start` - Botu başlat
 • `/durak <kod>` - Yeni durak ayarla
 • `/otobusler` veya `/bus` - Kayıtlı durağı sorgula
-• `/durağım` - Kayıtlı durak bilgini göster
+• `/duragim` - Kayıtlı durak bilgini göster
 • `/sil` - Kayıtlı durağı sil
 
 **Nasıl Kullanılır?**
@@ -463,7 +463,6 @@ def main():
     application.add_handler(CommandHandler("durak", station_command))
     application.add_handler(CommandHandler("otobusler", buses_command))
     application.add_handler(CommandHandler("bus", buses_command))
-    application.add_handler(CommandHandler("durağım", my_station_command))
     application.add_handler(CommandHandler("duragim", my_station_command))
     application.add_handler(CommandHandler("sil", delete_station_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
