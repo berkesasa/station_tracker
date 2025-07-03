@@ -17,6 +17,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# IETT bot için özel logging
+iett_logger = logging.getLogger('IETT_BOT')
+iett_logger.setLevel(logging.INFO)
+
 class IETTBot:
     def __init__(self, bot_token):
         self.bot_token = bot_token
@@ -161,6 +165,7 @@ class IETTBot:
             }
             
             response = self.session.get(url, headers=headers, timeout=15)
+            print(f"🚌 İETT isteği: {response.status_code} - Durak: {station_code}")
             logger.info(f"IETT request status: {response.status_code} for station {station_code}")
             
             if response.status_code == 200:
@@ -691,6 +696,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
     
+    print(f"📨 Mesaj alındı: '{text}' - Kullanıcı: {user_id}")
+    
     # URL kontrolü
     if "iett.istanbul" in text and "dkod=" in text:
         station_code = bot_instance.extract_station_code(text)
@@ -736,6 +743,8 @@ async def process_user_station_query(update: Update):
     """Kullanıcının kayıtlı durağını sorgular"""
     user_id = update.effective_user.id
     user_station = bot_instance.get_user_station(user_id)
+    
+    print(f"🔍 Kullanıcı {user_id} durak sorgusu başlatıldı")
     
     if not user_station:
         await update.message.reply_text(
@@ -815,7 +824,8 @@ def main():
         print("✅ Hızlı otobüs sorgulama")
         print("✅ URL desteği")
         print("✅ Kullanıcı durağı yönetimi")
-        print("\nDurdurmak için Ctrl+C basın")
+        print("\n🔄 Bot aktif - mesaj bekleniyor...")
+        print("Durdurmak için Ctrl+C basın")
         
         # Webhook'u temizle ve polling başlat
         async def cleanup_and_start():
