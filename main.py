@@ -186,11 +186,26 @@ class IETTBot:
                 # HTML içeriğini parse et
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
+                # Debug: HTML yapısını kontrol et
+                line_list = soup.find('div', class_='line-list')
+                line_items = soup.find_all('div', class_='line-item')
+                tables = soup.find_all('table')
+                
+                logger.info(f"HTML yapısı analizi - Durak {station_code}:")
+                logger.info(f"  - line-list div: {'✓' if line_list else '✗'}")
+                logger.info(f"  - line-item count: {len(line_items)}")
+                logger.info(f"  - table count: {len(tables)}")
+                
                 # Durak adını bul
                 station_name = self.extract_station_name_from_html(soup)
+                logger.info(f"  - Station name: {station_name}")
                 
                 # Otobüs bilgilerini çıkar
                 buses = self.parse_bus_times_from_html(soup, station_code)
+                
+                logger.info(f"  - Toplam otobüs bulundu: {len(buses)}")
+                for i, bus in enumerate(buses[:3]):  # İlk 3'ü log'la
+                    logger.info(f"    {i+1}. {bus.get('line')} - {bus.get('estimated_minutes')} dk - {bus.get('direction', '')[:30]}...")
                 
                 return {
                     "buses": buses,
@@ -279,20 +294,190 @@ class IETTBot:
             return self.get_fallback_bus_data(station_code)
     
     def extract_real_bus_data(self, soup):
-        """İETT web sitesindeki gerçek arrivals table'ından veri çıkarır"""
+        """İETT web sitesindeki gerçek line-list yapısından veri çıkarır"""
         buses = []
         try:
-            # Arrivals table'ını bul (farklı class isimleri dene)
+            # Önce line-list div'ini bul
+            line_list = soup.find('div', class_='line-list')
+            
+            if line_list:
+                logger.info("line-list div'i bulundu, otobüs verileri çıkarılıyor...")
+                buses = self.parse_line_list(line_list)
+                if buses:
+                    logger.info(f"line-list'ten {len(buses)} otobüs bulundu")
+                    return buses
+            
+            # Alternatif: line-item div'lerini direkt ara
+            line_items = soup.find_all('div', class_='line-item')
+            if line_items:
+                logger.info(f"{len(line_items)} line-item bulundu")
+                buses = self.parse_line_items(line_items)
+                if buses:
+                    logger.info(f"line-item'lardan {len(buses)} otobüs bulundu")
+                    return buses
+            
+            # Eski table yapısını kontrol et (fallback)
+            buses = self.extract_from_tables(soup)
+            if buses:
+                logger.info(f"Table yapısından {len(buses)} otobüs bulundu")
+                return buses
+            
+            # Eğer hiçbiri bulunamazsa div yapılarını kontrol et
+            buses = self.extract_from_bus_divs(soup)
+            if buses:
+                logger.info(f"Genel div yapısından {len(buses)} otobüs bulundu")
+            
+            return buses
+            
+        except Exception as e:
+            logger.error(f"Gerçek bus data çıkarma hatası: {e}")
+            return []
+    
+    def parse_line_list(self, line_list):
+        """line-list div'inden otobüs verilerini parse eder"""
+        buses = []
+        try:
+            # line-item div'lerini bul
+            line_items = line_list.find_all('div', class_='line-item')
+            
+            for item in line_items:
+                content = item.find('div', class_='content')
+                if not content:
+                    continue
+                
+                # Header'ı atla ("Duraktan Geçen Otobüsler" içeren)
+                if content.find('div', class_='content-header') or 'Duraktan Geçen' in content.get_text():
+                    continue
+                
+                # Hat numarasını al (span'den)
+                line_span = content.find('span')
+                if not line_span:
+                    continue
+                
+                line = line_span.get_text(strip=True)
+                
+                # Yön ve varış bilgisini al (p'den)
+                info_p = content.find('p')
+                if not info_p:
+                    continue
+                
+                info_text = info_p.get_text(strip=True)
+                
+                # Parse et
+                bus_info = self.parse_line_item_info(line, info_text)
+                if bus_info:
+                    buses.append(bus_info)
+                    logger.debug(f"line-list: Hat {line}, Info: {info_text}")
+            
+            return buses
+            
+        except Exception as e:
+            logger.error(f"line-list parsing hatası: {e}")
+            return []
+    
+    def parse_line_items(self, line_items):
+        """line-item div'lerini parse eder"""
+        buses = []
+        try:
+            for item in line_items:
+                content = item.find('div', class_='content')
+                if not content:
+                    continue
+                
+                # Header'ı atla
+                if content.find('div', class_='content-header') or 'Duraktan Geçen' in content.get_text():
+                    continue
+                
+                # Hat numarasını al
+                line_span = content.find('span')
+                if not line_span:
+                    continue
+                
+                line = line_span.get_text(strip=True)
+                
+                # Yön ve varış bilgisini al
+                info_p = content.find('p')
+                if not info_p:
+                    continue
+                
+                info_text = info_p.get_text(strip=True)
+                
+                # Parse et
+                bus_info = self.parse_line_item_info(line, info_text)
+                if bus_info:
+                    buses.append(bus_info)
+                    logger.debug(f"line-item: Hat {line}, Info: {info_text}")
+            
+            return buses
+            
+        except Exception as e:
+            logger.error(f"line-items parsing hatası: {e}")
+            return []
+    
+    def parse_line_item_info(self, line, info_text):
+        """Tek bir line item'ın bilgisini parse eder"""
+        try:
+            current_time = get_istanbul_time()
+            
+            # Örnek: "BOĞAZKÖY - AVCILAR METROBÜS (23:00) 2 dk"
+            # Yön bilgisini çıkar (bold tag öncesi)
+            direction = info_text
+            
+            # Bold tag içindeki bilgiyi bul
+            bold_match = re.search(r'\((\d{1,2}:\d{2})\)\s*(\d+)\s*dk', info_text)
+            
+            if bold_match:
+                arrival_time_str = bold_match.group(1)  # 23:00
+                minutes = int(bold_match.group(2))      # 2
+                
+                # Yön bilgisini temizle (bold kısmını çıkar)
+                direction = re.sub(r'\s*\([^)]+\)\s*\d+\s*dk.*$', '', info_text).strip()
+                
+                # Arrival time'ı hesapla
+                arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                
+                return {
+                    "line": line,
+                    "direction": direction,
+                    "arrival_time": arrival_time,
+                    "estimated_minutes": minutes,
+                    "scheduled_time": arrival_time_str  # Planlanmış saat
+                }
+            else:
+                # Bold format bulunamazsa basit parsing
+                time_match = re.search(r'(\d+)\s*(?:dk|dakika)', info_text)
+                minutes = int(time_match.group(1)) if time_match else 5
+                
+                # Yön bilgisini temizle
+                direction = re.sub(r'\s*\d+\s*(?:dk|dakika).*$', '', info_text).strip()
+                
+                arrival_time = (current_time + timedelta(minutes=minutes)).strftime("%H:%M")
+                
+                return {
+                    "line": line,
+                    "direction": direction,
+                    "arrival_time": arrival_time,
+                    "estimated_minutes": minutes
+                }
+            
+        except Exception as e:
+            logger.error(f"Line item info parsing hatası: {e}")
+            return None
+    
+    def extract_from_tables(self, soup):
+        """Eski table yapısından veri çıkarır (fallback)"""
+        buses = []
+        try:
+            # Table'ları bul
             tables = soup.find_all('table', class_=re.compile(r'arrivals?|bus|otobüs|hat', re.I))
             
-            # Genel table'ları da kontrol et
             if not tables:
                 tables = soup.find_all('table')
             
             for table in tables:
                 rows = table.find_all('tr')
                 
-                # Header row'u kontrol et - "Hat", "Dakika", "Saat" gibi kelimeler var mı
+                # Header row'u kontrol et
                 header_row = None
                 for row in rows:
                     row_text = row.get_text().lower()
@@ -316,20 +501,14 @@ class IETTBot:
                                 bus_info = self.create_enhanced_bus_info(line_text, time_text, destination_text)
                                 if bus_info:
                                     buses.append(bus_info)
-                                    logger.debug(f"Gerçek veri: Hat {line_text}, Dakika: {time_text}, Yön: {destination_text}")
                 
-                # En az bir otobüs bulunduysa, bu table'ı kullan
                 if buses:
                     break
-            
-            # Eğer table bulunamazsa div yapılarını kontrol et
-            if not buses:
-                buses = self.extract_from_bus_divs(soup)
             
             return buses
             
         except Exception as e:
-            logger.error(f"Gerçek bus data çıkarma hatası: {e}")
+            logger.error(f"Table parsing hatası: {e}")
             return []
     
     def extract_from_bus_divs(self, soup):
@@ -1022,6 +1201,7 @@ class IETTBot:
             arrival_time = bus.get("arrival_time", "")
             minutes = bus.get("estimated_minutes", 0)
             vehicle = bus.get("vehicle", "")
+            scheduled_time = bus.get("scheduled_time", "")
             
             if line == "Veri Yok":
                 continue
@@ -1034,15 +1214,20 @@ class IETTBot:
                 time_text = f"🟢 {minutes} dk"
             
             message += f"**{line}** - {time_text}\n"
-            message += f"🕐 Saat: {arrival_time}\n"
+            
+            # Planlanmış saat varsa göster
+            if scheduled_time:
+                message += f"🕐 Planlanmış: {scheduled_time} | Varış: {arrival_time}\n"
+            else:
+                message += f"🕐 Varış: {arrival_time}\n"
             
             # Otobüs numarası varsa göster
             if vehicle:
                 message += f"🚌 Otobüs: {vehicle}\n"
             
             if direction and direction != f"Hat {line} güzergahı":
-                message += f"📍 Yön: {direction[:45]}...\n" if len(direction) > 45 else f"📍 Yön: {direction}\n"
-            message += "─" * 25 + "\n"
+                message += f"📍 Yön: {direction[:50]}...\n" if len(direction) > 50 else f"📍 Yön: {direction}\n"
+            message += "─" * 30 + "\n"
         
         message += f"\n💡 Bilgileri yenilemek için: `/otobusler`"
         return message
