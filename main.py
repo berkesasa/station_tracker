@@ -6,6 +6,9 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import asyncio
 import logging
+from bs4 import BeautifulSoup
+import urllib.parse
+import time
 
 # Logging ayarları
 logging.basicConfig(
@@ -95,15 +98,35 @@ class IETTBot:
         try:
             # İETT web sitesinden veri çek
             url = f"https://iett.istanbul/StationDetail?dkod={station_code}"
-            response = self.session.get(url, timeout=15)
+            
+            # Headers'ı güncelle
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'tr-TR,tr;q=0.8,en-US;q=0.5,en;q=0.3',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            response = self.session.get(url, headers=headers, timeout=15)
+            logger.info(f"IETT request status: {response.status_code} for station {station_code}")
             
             if response.status_code == 200:
-                # Basit bir parsing yaklaşımı
-                content = response.text
+                # HTML içeriğini parse et
+                soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # JavaScript ile yüklenen veriyi bul
-                buses = self.parse_bus_times(content, station_code)
-                return {"buses": buses}
+                # Durak adını bul
+                station_name = self.extract_station_name_from_html(soup)
+                
+                # Otobüs bilgilerini çıkar
+                buses = self.parse_bus_times_from_html(soup, station_code)
+                
+                return {
+                    "buses": buses,
+                    "station_name": station_name,
+                    "last_updated": datetime.now().strftime("%H:%M")
+                }
             
         except Exception as e:
             logger.error(f"Web scraping hatası: {e}")
