@@ -1136,7 +1136,7 @@ def main():
         # Bot instance'ı oluştur
         bot_instance = IETTBot(BOT_TOKEN)
         
-        # Telegram Application oluştur - çakışmayı önlemek için webhook temizle
+        # Telegram Application oluştur
         application = Application.builder().token(BOT_TOKEN).build()
         
         # Handler'ları ekle
@@ -1161,17 +1161,7 @@ def main():
         print("\n🔄 Bot aktif - mesaj bekleniyor...")
         print("Durdurmak için Ctrl+C basın")
         
-        # Webhook'u temizle ve polling başlat
-        async def cleanup_and_start():
-            try:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                logger.info("Webhook temizlendi")
-                await asyncio.sleep(2)  # Kısa bekleme
-            except Exception as e:
-                logger.warning(f"Webhook temizleme hatası (normal): {e}")
-        
-        # Bot'u çalıştır - önce webhook temizle
-        asyncio.run(cleanup_and_start())
+        # Bot'u çalıştır
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
@@ -1179,27 +1169,28 @@ def main():
             timeout=20
         )
         
+    except KeyboardInterrupt:
+        print("\n🛑 Bot durduruldu")
+        logger.info("Bot kullanıcı tarafından durduruldu")
     except Exception as e:
-        logger.error(f"Bot başlatma hatası: {e}")
-        print(f"❌ Bot başlatılamadı: {e}")
+        logger.error(f"Bot hatası: {e}")
+        print(f"❌ Bot hatası: {e}")
         
-        # Alternatif başlatma yöntemi
-        print("🔄 Alternatif yöntemle tekrar deneniyor...")
-        time.sleep(5)
-        
+        # Basit fallback
         try:
+            print("🔄 Basit modda yeniden başlatılıyor...")
             application = Application.builder().token(BOT_TOKEN).build()
+            
+            # Temel handler'lar
             application.add_handler(CommandHandler("start", start))
             application.add_handler(CommandHandler("durak", station_command))
             application.add_handler(CommandHandler("otobusler", buses_command))
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             
-            application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
+            application.run_polling(drop_pending_updates=True)
+            
         except Exception as e2:
-            logger.error(f"Alternatif başlatma da başarısız: {e2}")
+            logger.error(f"Fallback başlatma hatası: {e2}")
             print(f"❌ Bot başlatılamadı: {e2}")
 
 if __name__ == "__main__":
